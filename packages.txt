@@ -1,0 +1,4 @@
+libreoffice-writer
+fonts-noto-cjk
+tesseract-ocr
+tesseract-ocr-chi-sim

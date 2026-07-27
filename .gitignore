@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Streamlit secrets — 本地测试用，绝不提交
+.streamlit/secrets.toml
+
+# 个人简历 / 生成产物，不应进入公开仓库
+*.docx
+*.doc
+*.pdf
+resumes/
+uploads/

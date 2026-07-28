@@ -30,6 +30,8 @@ from typing import Optional, Dict, List, Tuple
 
 # 文档处理
 from docx import Document
+from docx.shared import Pt
+from docx.oxml.ns import qn
 
 # PDF 处理
 import fitz  # PyMuPDF
@@ -40,6 +42,9 @@ from PIL import Image
 # 中文分词
 import jieba
 import jieba.analyse
+
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_DOUYIN_QR_PATH = os.path.join(_APP_DIR, "assets", "douyin_qr.jpg")
 
 # ============================================================================
 # 页面配置
@@ -385,6 +390,11 @@ TECH_SKILLS_DICT = {
     "数据分析", "团队管理", "跨部门沟通", "需求分析", "业务流程",
     "数字化转型", "系统实施", "解决方案", "产品设计", "用户体验",
     "英语", "日语", "德语",
+    # 战略/管理类（软技能，容易被漏掉，单独列出防止只靠 TF-IDF 兜底）
+    "战略规划", "组织变革", "变革管理", "预算管理", "供应商管理",
+    "风险管理", "绩效管理", "人才发展", "领导力", "决策", "谈判",
+    "客户关系管理", "股东管理", "董事会汇报", "并购整合", "商业分析",
+    "六西格玛", "精益生产", "质量管理体系", "供应链管理", "运营管理",
 }
 
 # 简历优化动作动词（中文）
@@ -427,11 +437,18 @@ def init_session_state():
             "step4": False,
             "step5": False,
             "step6": False,
+            "step7": False,
+            "step8": False,
         },
         "generated_pdf_path": None,
         "generated_pdf_name": None,
         "custom_rewrite_prompt": "",
         "last_rewrite_mode": None,
+        "output_language": "zh",
+        "need_translation": False,
+        "translated_resume_path": None,
+        "translated_resume_name": None,
+        "unlocked": False,
         # LLM 配置：每个会话独立，不预填任何人的 Key
         "llm_api_key": "",
         "llm_base_url": "https://api.deepseek.com",
@@ -590,11 +607,92 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _clean_text_keep_lines(text: str) -> str:
+    """
+    清洗文本用于按句/按行提取职责要求列表：只去掉括号类特殊字符，
+    保留原始换行——JD 里逐行罗列的要求全靠换行分隔，
+    如果像 _clean_text 一样把 \\s+ 折叠成一个空格，换行会被吃掉，
+    导致所有条目粘成一整句，只能提取出一条职责。
+    """
+    text = re.sub(r'[（()）【】\[\]{}「」""''""''·•●▪]', ' ', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+
 def _extract_sentences(text: str) -> List[str]:
     """将文本拆分为句子"""
     # 按常见分隔符拆分
     sentences = re.split(r'[。；;\n•·●\-\*]', text)
     return [s.strip() for s in sentences if len(s.strip()) > 5]
+
+
+_PHRASE_CONNECTORS = {"与", "和", "及", "、"}
+
+
+def _is_cjk_bigram(word: str) -> bool:
+    """只认"恰好2个汉字"的词——中文里"AABB"式四字术语几乎都是两个双字词拼成的
+    （战略+规划、根因+分析），限制在这个模式上最安全，不会把整句话越滚越长。"""
+    return len(word) == 2 and all('一' <= ch <= '鿿' for ch in word)
+
+
+def _merge_fragmented_terms(job_text: str, keyword_scores: Dict[str, float],
+                             exclude_words: set) -> Dict[str, float]:
+    """
+    jieba 经常把一个完整术语拆成两个独立小词——比如"战略与规划"拆成
+    "战略"/"与"/"规划"，"根因分析"拆成"根因"/"分析"。这些碎片单独显示出来
+    看不出原意，需要按原文里的实际相邻关系拼回去。
+
+    只做"恰好两个双字候选词"的拼接，不做链式合并（不会拼出"业务部门落地优化"
+    这种把好几个不相关的词粘成一整句的结果）；且排除通用动词（确保/主导/推动等），
+    否则"确保"+"流程"这类动词+名词也会被误拼成一个"技能"。
+
+    像"流程 战略 与 规划"这种一个词有两个方向都能配对的情况（"流程"+"战略"
+    零间隔在先，"战略"+"规划"隔着"与"在后），不能简单按从左到右第一个碰到的
+    配对，也不能纯按权重——"流程"权重高到跟谁配都会分数很高，会抢走"战略"。
+    "X与Y/X和Y"这种带连接词的配对是明确的书面信号（作者存心把两个词并列
+    写在一起当成一个概念），比单纯位置相邻更可靠，所以优先处理带连接词的
+    配对，都定下来之后，剩下没被占用的词再按权重从高到低配零间隔的配对。
+    """
+    tokens = list(jieba.tokenize(job_text))
+    n = len(tokens)
+
+    connector_pairs = []   # (combined_score, left_word, right_word)
+    adjacent_pairs = []
+    for i in range(n - 1):
+        word = tokens[i][0]
+        nxt_word = tokens[i + 1][0]
+        has_connector = nxt_word in _PHRASE_CONNECTORS and i + 2 < n
+        if has_connector:
+            nxt_word = tokens[i + 2][0]
+
+        eligible = (
+            word in keyword_scores and nxt_word in keyword_scores
+            and word not in exclude_words and nxt_word not in exclude_words
+            and word != nxt_word
+            and _is_cjk_bigram(word) and _is_cjk_bigram(nxt_word)
+        )
+        if not eligible:
+            continue
+        entry = (keyword_scores[word] + keyword_scores[nxt_word], word, nxt_word)
+        (connector_pairs if has_connector else adjacent_pairs).append(entry)
+
+    connector_pairs.sort(key=lambda p: p[0], reverse=True)
+    adjacent_pairs.sort(key=lambda p: p[0], reverse=True)
+
+    merged_scores = dict(keyword_scores)
+    consumed = set()
+    for phrase_score, word, nxt_word in connector_pairs + adjacent_pairs:
+        if word in consumed or nxt_word in consumed:
+            continue
+        phrase = word + nxt_word
+        merged_scores[phrase] = max(merged_scores.get(phrase, 0), phrase_score)
+        consumed.add(word)
+        consumed.add(nxt_word)
+
+    for p in consumed:
+        merged_scores.pop(p, None)
+
+    return merged_scores
 
 
 def get_job_keywords(job_text: str) -> Dict:
@@ -606,10 +704,14 @@ def get_job_keywords(job_text: str) -> Dict:
     cleaned = _clean_text(job_text)
 
     # 1. 使用 jieba TF-IDF 提取关键词
-    jieba_keywords_raw = jieba.analyse.extract_tags(cleaned, topK=30, withWeight=True)
+    # topK 原来是30，但像"规划"这种词单独看权重不够高，进不了前30，
+    # 就永远没机会跟"战略"拼成"战略规划"——下面拼接术语那一步需要一个更完整
+    # 的候选词池，topK=0 表示不限制数量，返回全部候选词（最终展示时该多少
+    # 还是多少，后面有单独的截断逻辑，不会因为候选池变大就显示变多）。
+    jieba_keywords_raw = jieba.analyse.extract_tags(cleaned, topK=0, withWeight=True)
 
     # 2. 使用 jieba TextRank 提取关键词（互补算法）
-    jieba_textrank_raw = jieba.analyse.textrank(cleaned, topK=20, withWeight=True)
+    jieba_textrank_raw = jieba.analyse.textrank(cleaned, topK=0, withWeight=True)
 
     # 合并去重
     keyword_scores = {}
@@ -618,48 +720,80 @@ def get_job_keywords(job_text: str) -> Dict:
     for word, weight in jieba_textrank_raw:
         keyword_scores[word] = keyword_scores.get(word, 0) + weight
 
+    # 2.5 把被拆散的完整术语重新拼回去（战略+与+规划 → 战略规划，根因+分析 → 根因分析）
+    # 排除通用动词，否则"确保"+"流程"这类动词+名词也会被误拼成"技能"
+    _generic_verbs = {v.lower() for v in ACTION_VERBS_CN} | {"确保"}
+    keyword_scores = _merge_fragmented_terms(job_text, keyword_scores, _generic_verbs)
+
     # 3. 与技能词典交叉匹配，标记技能词
+    # 注意：word_lower in skill 这个方向必须限制关键词长度 >= 3，
+    # 否则"管理""经验""沟通"这类通用短词会被当成子串误命中所有
+    # 带"管理"的复合技能词（比如"客户关系管理"），导致 JD 里根本没提到的
+    # 技能被错误列出来。
     matched_skills = []
     for word in sorted(keyword_scores, key=keyword_scores.get, reverse=True):
         word_lower = word.lower()
         for skill in TECH_SKILLS_DICT:
-            if skill in word_lower or word_lower in skill:
+            if skill in word_lower or (len(word_lower) >= 3 and word_lower in skill):
                 if skill not in [s.lower() for s in matched_skills]:
                     matched_skills.append(skill)
                 break
 
-    # 如果词典匹配不足，从 TF-IDF 中补充
-    if len(matched_skills) < 5:
-        for word, _ in jieba_keywords_raw[:20]:
-            if len(word) >= 2 and word not in [s.lower() for s in matched_skills]:
-                # 检查是否是英文缩写/专业术语
-                if re.match(r'^[A-Za-z0-9\+\#\.]+$', word) or len(word) >= 3:
-                    matched_skills.append(word)
+    # 用高权重词补充词典之外的技能。词典不可能穷举所有技能/管理术语，
+    # 之前这里写成"词典命中不足5个才补充"，导致像"战略规划"这种没收进词典、
+    # 但在原文里权重很高的词，只要词典命中数已经 >=5 就永远补不进来。
+    # 现在按权重排序持续补充，直到凑满12个技能上限为止。
+    # 另外原来要求补充词长度 >=3，但中文里大量有意义的名词/术语正好是2个字
+    # （战略、风控、治理、预算、团队、沟通、流程、合规……），>=3 会把它们全部
+    # 挡在外面——比如"流程战略与规划"被 jieba 拆成"战略"+"规划"两个词，
+    # 各自都只有2个字，>=3 的门槛会让"战略规划"这个核心要求彻底消失。
+    # 改成 >=2，配合 jieba.analyse 本身已经过滤掉的停用词，足够安全。
+    # 但 >=2 之后，"确保""优化""设计"这类通用动词权重也很高，会被当成"技能"
+    # 混进来——它们是动作，不是技能名词，排除掉（_generic_verbs 在上面拼接
+    # 术语时已经定义过，这里直接复用）。
+    for word, _ in sorted(keyword_scores.items(), key=lambda kv: kv[1], reverse=True):
+        if len(matched_skills) >= 12:
+            break
+        if word.lower() in [s.lower() for s in matched_skills] or word.lower() in _generic_verbs:
+            continue
+        is_english_term = re.match(r'^[A-Za-z0-9\+\#\.]+$', word)
+        if is_english_term or len(word) >= 2:
+            matched_skills.append(word)
 
     matched_skills = matched_skills[:12]  # 最多12个技能
 
-    # 4. 从原文提取句子作为"要求/职责"
-    sentences = _extract_sentences(cleaned)
+    # 4. 从原文提取句子作为"要求/职责"（用保留换行的清洗结果，否则逐行列出的
+    # 要求会被 _clean_text 的 \s+ 折叠成一整句，只能提出一条）
+    sentences = _extract_sentences(_clean_text_keep_lines(job_text))
     requirements = []
+    # 职责描述用的动词远不止"负责/具备/熟悉"这几个——像"承接、制定、落实、
+    # 建立、引入、发现、识别、组织、跟踪、推行、统筹"这些常见 JD 动词原来都不在
+    # 名单里，导致一份职责描述里大部分条目被判定为"没有动词"而整条丢弃，
+    # 复用已有的 ACTION_VERBS_CN（简历改写用的强动词库）+ 补充一批 JD 常见动词。
+    _requirement_hints = set(ACTION_VERBS_CN) | {
+        "要求", "具备", "熟悉", "掌握", "经验", "能力", "优先", "熟练",
+        "承接", "落实", "建立", "引入", "发现", "识别", "组织", "跟踪",
+        "推行", "统筹", "监控", "评估", "审核", "把控", "对接",
+        "require", "responsible", "experience", "skill", "ability", "manage",
+    }
     for sent in sentences:
         # 筛选含动词的长句作为职责描述
-        has_action = any(verb in sent for verb in ["负责", "要求", "具备", "熟悉", "掌握",
-                                                      "经验", "能力", "优先", "熟练",
-                                                      "require", "responsible", "experience",
-                                                      "skill", "ability", "manage"])
+        has_action = any(verb in sent for verb in _requirement_hints)
         if has_action and len(sent) > 10:
             requirements.append(sent)
 
     requirements = requirements[:10]  # 最多10条
 
     # 5. 提取最终关键词列表（TF-IDF + 技能词 + 高频词）
+    # 用合并过碎片的 keyword_scores 而不是原始 jieba_keywords_raw，
+    # 否则这里又会重新混入"战略""根因"这类拼回去之前的碎片词。
     keywords = []
     # 加入技能词
     for skill in matched_skills:
         if skill not in keywords:
             keywords.append(skill)
-    # 加入 TF-IDF 高频词
-    for word, _ in jieba_keywords_raw[:20]:
+    # 加入高权重词
+    for word, _ in sorted(keyword_scores.items(), key=lambda kv: kv[1], reverse=True)[:20]:
         if word not in keywords and len(word) >= 2 and not word.isdigit():
             keywords.append(word)
 
@@ -837,6 +971,21 @@ def _llm_available() -> bool:
         return False
 
 
+def _detect_language(text: str) -> str:
+    """
+    轻量语言检测：统计中文字符在所有字母字符中的占比。
+    占比超过阈值判定为中文('zh')，否则判定为英文('en')。
+    不引入额外依赖，够用于区分中/英文简历与JD。
+    """
+    if not text:
+        return "zh"
+    cjk_count = sum(1 for ch in text if '一' <= ch <= '鿿')
+    letter_count = sum(1 for ch in text if ch.isalpha())
+    if letter_count == 0:
+        return "zh"
+    return "zh" if (cjk_count / letter_count) > 0.15 else "en"
+
+
 def _call_llm(system_prompt: str, user_prompt: str, max_retries: int = 2) -> Optional[str]:
     """
     调用 LLM API（OpenAI 兼容接口）。
@@ -990,13 +1139,18 @@ def _extract_resume_sections(doc) -> List[Dict]:
     for i, (start_idx, section_type, header_text) in enumerate(section_boundaries):
         end_idx = section_boundaries[i+1][0] if i+1 < len(section_boundaries) else len(all_paras)
         content_paras = []
-        content_texts = []
         for idx in range(start_idx + 1, min(end_idx, len(all_paras))):
             item = all_paras[idx]
-            text = _get_para_text(item)
-            if text:
+            if _get_para_text(item):
                 content_paras.append((idx, item))
-                content_texts.append(text)
+
+        # "工作经历"区块通常一次性收了好几家公司的标题/日期/要点，混在一起
+        # 按行数对应改写风险很高（见 _split_experience_anchors_and_bullets 的
+        # 说明）。这里先把公司/职位/日期这类锚点行摘出来，永远不参与改写，
+        # 只把真正的经历要点交给 LLM 按行对应替换。
+        if section_type == "experience" and content_paras:
+            anchor_indices, content_paras = _split_experience_anchors_and_bullets(content_paras)
+        content_texts = [_get_para_text(item) for _, item in content_paras]
 
         sections.append({
             "type": section_type,
@@ -1020,6 +1174,66 @@ def _get_para_text(item) -> str:
         elif item[2] is not None:
             return item[2].text.strip()
     return ""
+
+
+_DATE_ONLY_RE = re.compile(
+    r'^[\d年月\.\-/\s]+[-–—~至今现在present]+[\d年月\.\-/\s至今现在presentPRESENT]*$',
+    re.IGNORECASE,
+)
+
+
+def _get_item_paragraph(item):
+    """拿到 item 底层的 python-docx Paragraph 对象（虚拟行没有，返回 None）"""
+    src_type = item[0]
+    if src_type == "doc_para":
+        return item[2]
+    if src_type == "table_cell" and item[2] is not None:
+        return item[2]
+    return None
+
+
+def _get_item_font_size_pt(item) -> Optional[float]:
+    """拿该段落第一个非空 run 的字号（pt），拿不到返回 None"""
+    para = _get_item_paragraph(item)
+    if para is None:
+        return None
+    for run in para.runs:
+        if run.text.strip() and run.font.size is not None:
+            return run.font.size.pt
+    return None
+
+
+def _split_experience_anchors_and_bullets(items: List[Tuple[int, tuple]]) -> Tuple[list, list]:
+    """
+    "工作经历"区块里混着公司/职位/日期这类锚点行和真正的经历要点(bullet)。
+    LLM 按行数对应改写时，如果把锚点行也当成普通内容去替换，一旦 LLM 返回的
+    行数和原文对不上（几乎总会对不上——LLM 经常合并/拆分要点），后面所有行
+    就会错位串到别的段落里，公司名/日期就会顶替成要点内容，格式(字号/加粗)
+    也就跟着错乱——这正是"格式全变了"的根因。
+    这里把明显是锚点的行（纯日期行、或字号明显比同区块正文大的行/加粗的
+    职位行）单独挑出来，永远不参与 LLM 改写、原样保留；只把剩下的真正
+    bullet 内容交给 LLM 按行对应替换，大幅降低错位概率。
+    返回 (anchor_indices_set, bullet_items)。
+    """
+    sizes = [s for s in (_get_item_font_size_pt(item) for _, item in items) if s is not None]
+    if not sizes:
+        return set(), items
+    # 正文字号通常是出现次数最多的那个
+    body_size = max(set(sizes), key=sizes.count)
+
+    anchor_indices = set()
+    bullet_items = []
+    for idx, item in items:
+        text = _get_para_text(item)
+        size = _get_item_font_size_pt(item)
+        is_date_line = bool(_DATE_ONLY_RE.match(text)) and len(text) <= 40
+        is_larger_header = size is not None and size > body_size + 0.5
+        if is_date_line or is_larger_header:
+            anchor_indices.add(idx)
+        else:
+            bullet_items.append((idx, item))
+
+    return anchor_indices, bullet_items
 
 
 def _build_full_resume_text(sections: List[Dict]) -> str:
@@ -1147,6 +1361,57 @@ def _get_item_text(item) -> str:
     return ""
 
 
+def _rewrite_para_runs_preserving_style(para, new_text: str) -> None:
+    """
+    把新文字写回一个段落，尽量保留原有的"加粗标签 + 正常内容"两段式格式。
+
+    简历里很多要点是"粗体小标题 + 冒号 + 正常内容"这种结构（比如"转型战略与
+    平台本地化" [粗体] + "：具备18年..." [不粗体]），原来一律把全部新文字塞进
+    第一个 run：如果第一个 run 原本是粗体标签，新文字（一整句）就会被整句拍成
+    粗体；如果强制把它设成不粗体（之前的做法），粗体标签又会丢。
+    这里改成：找到"第一个不是粗体的 run"作为分界——它之前的 run 当作粗体标签，
+    它自己和之后的 run 当作正常内容；新文字如果也带冒号，就按冒号切开分别塞回
+    两边，尽量还原原来的格式，而不是让整句话变成同一种粗细。
+    """
+    runs = [r for r in para.runs if r.text]
+    if not runs:
+        if para.runs:
+            para.runs[0].text = new_text
+        else:
+            para.add_run(new_text)
+        return
+
+    first_nonbold_idx = None
+    for i, r in enumerate(runs):
+        if not r.bold:
+            first_nonbold_idx = i
+            break
+
+    if first_nonbold_idx is None or first_nonbold_idx == 0:
+        # 没有"粗体前缀 + 正常内容"结构（要么整段原本就全粗体，要么本来就不粗体）
+        # 直接整段替换，保留这个 run 原有的粗细
+        runs[0].text = new_text
+        for r in runs[1:]:
+            r.text = ""
+        return
+
+    label_sep = next((c for c in ("：", ":") if c in new_text), None)
+    if label_sep:
+        label_part, _, rest_part = new_text.partition(label_sep)
+        new_label, new_rest = label_part, label_sep + rest_part
+    else:
+        # 新文字没有冒号，没法按原结构切分，沿用原标签文字，剩下整句当内容
+        new_label = "".join(r.text for r in runs[:first_nonbold_idx])
+        new_rest = new_text
+
+    runs[0].text = new_label
+    for r in runs[1:first_nonbold_idx]:
+        r.text = ""
+    runs[first_nonbold_idx].text = new_rest
+    for r in runs[first_nonbold_idx + 1:]:
+        r.text = ""
+
+
 def _write_item_if_changed(item, new_text: str) -> bool:
     """将文本写入段落（支持文档段落和表格内段落）。返回是否实际修改"""
     new_text = (new_text or "").strip()
@@ -1165,13 +1430,9 @@ def _write_item_if_changed(item, new_text: str) -> bool:
     if src_type == "doc_para":
         para = item[2]
         if para.runs:
-            first_run = para.runs[0]
-            for r_idx in range(1, len(para.runs)):
-                para.runs[r_idx].text = ""
-            first_run.text = new_text
-            first_run.bold = False
+            _rewrite_para_runs_preserving_style(para, new_text)
         else:
-            para.add_run(new_text).bold = False
+            para.add_run(new_text)
         return True
 
     elif src_type == "table_cell":
@@ -1182,13 +1443,9 @@ def _write_item_if_changed(item, new_text: str) -> bool:
         elif item[2] is not None:
             para = item[2]
             if para.runs:
-                first_run = para.runs[0]
-                for r_idx in range(1, len(para.runs)):
-                    para.runs[r_idx].text = ""
-                first_run.text = new_text
-                first_run.bold = False
+                _rewrite_para_runs_preserving_style(para, new_text)
             else:
-                para.add_run(new_text).bold = False
+                para.add_run(new_text)
             return True
 
     return False
@@ -1221,14 +1478,39 @@ def _texts_effectively_equal(text1: str, text2: str) -> bool:
 
 
 def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
-                              resume_text: str, custom_instructions: str = "") -> Tuple[str, str]:
+                              resume_text: str, custom_instructions: str = "",
+                              target_language: str = "zh", translating: bool = False) -> Tuple[str, str]:
     """
     按用户建议，一次性把完整 JD 和完整简历发给 LLM，让它产出完整新简历。
     Prompt 强调：【禁止复制原文】，必须根据 JD 真正改写内容。
+    target_language: 输出简历使用的语言，'zh' 或 'en'。
+    translating: 原简历语言与 target_language 不一致时为 True，需要真正翻译而不只是改写。
     """
     keywords = job_analysis.get("keywords", [])
     requirements = job_analysis.get("requirements", [])
     skills = job_analysis.get("skills", [])
+    lang_name = {"zh": "中文", "en": "英文（English）"}.get(target_language, "中文")
+
+    if translating:
+        language_instruction = (
+            "\n🌐 语言要求（最高优先级，与其他规则冲突时以此为准）：\n"
+            "═══════════════════════════════════════\n"
+            f"原始简历与目标输出语言不一致，你必须把简历内容【全部翻译并用{lang_name}重新撰写】，\n"
+            "禁止把原文语言的句子直接照抄或逐字直译，要按目标语言地道的简历表达习惯重新组织\n"
+            "（强动词开头、简洁的项目符号句式，避免生硬的翻译腔）。\n"
+            "公司名、产品/工具名称等专有名词（如 SAP、Kubernetes）可保留原文，其余一律使用目标语言。\n"
+            "教育背景区块也需要翻译（学校/学位/专业名称等），但日期、数字保持不变、不得编造。\n"
+            "═══════════════════════════════════════\n"
+        )
+    else:
+        language_instruction = (
+            "\n🌐 语言要求：\n"
+            "═══════════════════════════════════════\n"
+            f"全篇改写内容请使用{lang_name}撰写，与原始简历语言保持一致。\n"
+            "如果岗位描述(JD)的关键词是另一种语言，请将其自然转换为目标语言的对应表达再融入简历，\n"
+            "专有名词/技术术语可保留原文。\n"
+            "═══════════════════════════════════════\n"
+        )
 
     custom_instructions_block = ""
     if custom_instructions.strip():
@@ -1254,11 +1536,14 @@ def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
         "- 保留原文的真实数字指标（百分比、金额、效率提升等）\n"
         "- 同一区块内多条经历使用不同句式和表述，禁止重复\n"
         "- 不编造虚假技能/项目，但可以用JD术语重新包装现有经验\n"
-        "- 禁止使用markdown格式（不要用**加粗**），只用纯文本"
+        "- 禁止使用markdown格式（不要用**加粗**），只用纯文本\n"
+        f"- 最终输出必须全部使用{lang_name}"
+        + ("，原文是另一种语言的内容必须先理解语义再重新用目标语言撰写，不能直译" if translating else "")
     )
 
     user_prompt = f"""
 你是一名简历优化专家。请根据下面的岗位要求(JD)，对我的原始简历进行【实质性改写】。
+{language_instruction}
 
 ═══════════════════════════════════════
 ⚠️ 核心要求（违反将导致改写失败）：
@@ -1284,7 +1569,7 @@ def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
 • 技能列表/核心能力：补充 JD 要求但原始简历中缺失的硬技能，重新归类排版
 • 工作经历/项目经验：每条经历改写为"强动词 + JD 关键词 + 量化结果"结构，
   将每段经历导向 JD 所在行业场景，让 HR 看到高度匹配
-• 教育背景：保持不变（不修改）
+• 教育背景：{"翻译学校/学位/专业名称为目标语言，日期与数字保持不变、不得编造" if translating else "保持不变（不修改）"}
 
 ═══════════════════════════════════════
 📄 输出格式（严格遵循）：
@@ -1353,11 +1638,42 @@ def _parse_llm_resume_output(response_text: str) -> Dict[str, str]:
     return sections
 
 
+_SECTION_TYPE_NAME_CANDIDATES = {
+    "summary": ["个人总结", "自我评价", "个人简介", "summary"],
+    "skills": ["技能", "核心能力", "专业能力", "skills"],
+    "experience": ["工作经历", "项目经验", "职业经历", "experience"],
+    "education": ["教育背景", "教育经历", "education"],
+    "header": ["个人信息", "联系方式", "基本信息", "header"],
+}
+
+
+def _match_llm_section_key(sec: Dict, sec_idx: int, llm_sections: Dict[str, str],
+                            llm_section_keys: List[str]) -> Optional[str]:
+    """
+    把 doc 区块匹配到 LLM 输出的对应区块：标题精确匹配 → 类型模糊匹配 → 顺序兜底匹配。
+    """
+    if sec["header_text"] and sec["header_text"] in llm_sections:
+        return sec["header_text"]
+
+    candidates = _SECTION_TYPE_NAME_CANDIDATES.get(sec["type"], [])
+    for key in llm_section_keys:
+        key_lower = key.lower()
+        for cand in candidates:
+            if cand.lower() in key_lower:
+                return key
+
+    if sec_idx < len(llm_section_keys):
+        return llm_section_keys[sec_idx]
+    return None
+
+
 def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
-                              job_analysis: Dict, custom_instructions: str = "") -> str:
+                              job_analysis: Dict, custom_instructions: str = "",
+                              target_language: str = "zh") -> str:
     """
     使用大模型(LLM)一次性改写整份简历，再按区块回填到 docx。
     彻底解决段落编号导致的重复问题。
+    target_language: 期望输出的简历语言（'zh'/'en'）；与原简历检测语言不同时会触发翻译。
     """
     st.info(f"🤖 正在使用 LLM ({st.session_state['llm_model']}) 进行整份简历改写...")
 
@@ -1367,11 +1683,14 @@ def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
 
     # 2. 构建完整简历文本
     full_resume_text = _build_full_resume_text(sections)
+    resume_lang = _detect_language(full_resume_text)
+    translating = target_language in ("zh", "en") and target_language != resume_lang
 
     # 3. 构建 Prompt 并调用 LLM
     with st.spinner("🧠 LLM 正在理解岗位要求并重写整份简历（约 20-40 秒）..."):
         system_prompt, user_prompt = _build_rewrite_prompt_v2(
-            job_description, job_analysis, full_resume_text, custom_instructions)
+            job_description, job_analysis, full_resume_text, custom_instructions,
+            target_language, translating)
 
         response_text = _call_llm(system_prompt, user_prompt)
 
@@ -1408,38 +1727,14 @@ def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
     llm_section_keys = list(llm_sections.keys())
 
     for sec_idx, sec in enumerate(sections):
-        # 用区块标题或类型名去匹配 LLM 返回的区块
-        best_match_key = None
-        # 优先用原标题匹配
-        if sec["header_text"] and sec["header_text"] in llm_sections:
-            best_match_key = sec["header_text"]
-        else:
-            # 用类型名模糊匹配
-            type_name_map = {
-                "summary": ["个人总结", "自我评价", "个人简介", "summary"],
-                "skills": ["技能", "核心能力", "专业能力", "skills"],
-                "experience": ["工作经历", "项目经验", "职业经历", "experience"],
-                "education": ["教育背景", "教育经历", "education"],
-                "header": ["个人信息", "联系方式", "基本信息", "header"],
-            }
-            candidates = type_name_map.get(sec["type"], [])
-            for key in llm_section_keys:
-                key_lower = key.lower()
-                for cand in candidates:
-                    if cand.lower() in key_lower:
-                        best_match_key = key
-                        break
-                if best_match_key:
-                    break
-
-            # 兜底：按顺序匹配（LLM 通常保持原有顺序）
-            if not best_match_key and sec_idx < len(llm_section_keys):
-                best_match_key = llm_section_keys[sec_idx]
+        best_match_key = _match_llm_section_key(sec, sec_idx, llm_sections, llm_section_keys)
 
         if best_match_key:
             new_text = llm_sections[best_match_key]
-            # 跳过 header 和 education 类型（通常不需要改写）
-            if sec["type"] in ("header", "education"):
+            # header（联系方式）始终保持原样；education 仅在无需翻译时保持原样，
+            # 需要翻译时 education 也要回填（学校/学位翻译成目标语言）
+            skip_types = ("header",) if translating else ("header", "education")
+            if sec["type"] in skip_types:
                 skipped_sections.append(f"{sec.get('header_text', sec['type'])} (保持原样)")
                 continue
             modified = _apply_section_content(sec, new_text)
@@ -1484,6 +1779,134 @@ def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
         st.caption(f"⏭️ 已跳过：{' | '.join(skipped_sections)}")
     if failed_sections:
         st.caption(f"⚠️ 未匹配：{' | '.join(failed_sections)}")
+    return new_path
+
+
+# ---------------------------------------------------------------------------
+# 独立功能：中文简历一键翻译成英文 + 统一字体（不依赖 JD/匹配流程）
+# ---------------------------------------------------------------------------
+
+def _build_translate_prompt(resume_text: str) -> Tuple[str, str]:
+    """构建纯翻译 Prompt：只做语言转换，不按 JD 改写内容，不新增不编造。"""
+    system_prompt = (
+        "你是一位专业简历翻译专家，负责把简历从中文准确翻译成地道的英文简历。\n"
+        "只做语言转换和地道表达优化，禁止新增、删减或编造任何事实信息。\n"
+        "公司名、产品/工具名称等专有名词可保留原文。\n"
+        "禁止使用 markdown 格式（不要 **加粗**），只用纯文本。"
+    )
+
+    user_prompt = f"""请将下面的简历内容完整翻译成英文，要求：
+
+1. 忠实原意，不遗漏、不新增、不编造内容
+2. 使用地道的英文简历表达（强动词开头、简洁句式），不要逐字直译
+3. 数字、日期、百分比等量化信息保持不变
+4. 公司名、产品/工具名称等专有名词可保留原文
+5. 区块标题必须与原文完全一致（标题只用于内部匹配定位，不要翻译标题本身）
+6. 禁止使用 markdown 格式，只用纯文本
+
+═══════════════════════════════════════
+📄 输出格式（严格遵循）：
+═══════════════════════════════════════
+
+每个区块用以下格式标记：
+===== SECTION: 区块标题 =====
+（翻译后的内容）
+
+═══════════════════════════════════════
+📝 原始简历（请翻译以下每个区块的内容）：
+═══════════════════════════════════════
+{resume_text}
+
+请现在开始输出翻译后的完整简历。"""
+    return system_prompt, user_prompt
+
+
+def _unify_font(doc, font_name: str = "Calibri", font_size_pt: float = 11) -> None:
+    """
+    把文档中所有段落（含表格内）的字体统一设置为指定字体和字号。
+    同时设置西文字体(ascii)和中文字体(eastAsia)，避免中英混排时中文回退成默认字体。
+    """
+    def _apply_run(run):
+        run.font.name = font_name
+        run.font.size = Pt(font_size_pt)
+        rpr = run._element.get_or_add_rPr()
+        rfonts = rpr.find(qn('w:rFonts'))
+        if rfonts is None:
+            rfonts = rpr.makeelement(qn('w:rFonts'), {})
+            rpr.append(rfonts)
+        rfonts.set(qn('w:ascii'), font_name)
+        rfonts.set(qn('w:hAnsi'), font_name)
+        rfonts.set(qn('w:eastAsia'), font_name)
+
+    for para in doc.paragraphs:
+        for run in para.runs:
+            _apply_run(run)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        _apply_run(run)
+
+
+def _translate_resume_to_english(uploaded_doc_path: str) -> str:
+    """
+    独立功能：把一份中文（或任意语言）Word 简历一键翻译成英文，
+    保留原始 docx 结构/排版，翻译完成后统一字体，另存为新文件。
+    """
+    st.info(f"🌐 正在使用 LLM ({st.session_state['llm_model']}) 翻译简历...")
+
+    doc = Document(uploaded_doc_path)
+    sections = _extract_resume_sections(doc)
+    full_resume_text = _build_full_resume_text(sections)
+
+    with st.spinner("🧠 LLM 正在翻译整份简历（约 20-40 秒）..."):
+        system_prompt, user_prompt = _build_translate_prompt(full_resume_text)
+        response_text = _call_llm(system_prompt, user_prompt)
+
+    if not response_text:
+        raise Exception("LLM 未返回有效响应，请检查 API 配置或网络连接")
+
+    llm_sections = _parse_llm_resume_output(response_text)
+    if not llm_sections:
+        st.error("⚠️ LLM 返回格式异常，无法识别区块标记")
+        with st.expander("👀 查看 LLM 原始响应（前 2000 字）"):
+            st.code(response_text[:2000])
+        raise Exception("LLM 响应格式异常，请重试或切换模型")
+
+    total_modified = 0
+    llm_section_keys = list(llm_sections.keys())
+    for sec_idx, sec in enumerate(sections):
+        best_match_key = _match_llm_section_key(sec, sec_idx, llm_sections, llm_section_keys)
+        if not best_match_key:
+            continue
+        # 联系方式/个人信息保持原样（姓名、电话、邮箱不需要翻译）
+        if sec["type"] == "header":
+            continue
+        total_modified += _apply_section_content(sec, llm_sections[best_match_key])
+
+    if total_modified == 0:
+        st.error("⚠️ LLM 返回的翻译内容与原简历完全一致，0 处段落被修改")
+        raise Exception("翻译后未检测到任何内容变化，请重试或切换模型")
+
+    # 统一字体，保证整份文档观感一致
+    _unify_font(doc, font_name="Calibri", font_size_pt=11)
+
+    output_dir = os.path.dirname(uploaded_doc_path)
+    original_name = os.path.basename(uploaded_doc_path)
+    name_without_ext, ext = os.path.splitext(original_name)
+    new_name = f"{name_without_ext}_English{ext}"
+    new_path = os.path.join(output_dir, new_name)
+
+    counter = 1
+    while os.path.exists(new_path):
+        new_name = f"{name_without_ext}_English_v{counter}{ext}"
+        new_path = os.path.join(output_dir, new_name)
+        counter += 1
+
+    doc.save(new_path)
+    st.caption(f"📊 翻译统计：共 {len(llm_sections)} 个区块，实际修改 {total_modified} 处段落 | 字体已统一为 Calibri 11")
     return new_path
 
 
@@ -2198,16 +2621,13 @@ def _rewrite_resume_local(matched_doc_path: str, job_description: str, job_analy
                         new_text = _enhance_experience_text(
                             original_text, relevant, top_keywords)
 
-            # ---- 写回段落 ----
+            # ---- 写回段落（尽量保留"粗体标签+正常内容"结构，见
+            # _rewrite_para_runs_preserving_style） ----
             if new_text != original_text:
                 if para.runs:
-                    first_run = para.runs[0]
-                    for i in range(1, len(para.runs)):
-                        para.runs[i].text = ""
-                    first_run.text = new_text
-                    first_run.bold = False
+                    _rewrite_para_runs_preserving_style(para, new_text)
                 else:
-                    para.add_run(new_text).bold = False
+                    para.add_run(new_text)
                 total_modified += 1
 
             para_idx += 1
@@ -2237,13 +2657,9 @@ def _rewrite_resume_local(matched_doc_path: str, job_description: str, job_analy
 
                             if new_text != original_text:
                                 if para.runs:
-                                    first_run = para.runs[0]
-                                    for i in range(1, len(para.runs)):
-                                        para.runs[i].text = ""
-                                    first_run.text = new_text
-                                    first_run.bold = False
+                                    _rewrite_para_runs_preserving_style(para, new_text)
                                 else:
-                                    para.add_run(new_text).bold = False
+                                    para.add_run(new_text)
                                 total_modified += 1
 
     # ====== 4. 保存新文件 ======
@@ -2269,6 +2685,107 @@ def _rewrite_resume_local(matched_doc_path: str, job_description: str, job_analy
 
 
 # ============================================================================
+# 访问口令：关注抖音进群领密码
+# ============================================================================
+
+def _get_access_password() -> str:
+    """
+    从 Streamlit secrets 读取当前有效的访问密码。
+    密码在 st.secrets['access_password'] 里配置，Wendy 通过 Streamlit Cloud
+    后台的 Secrets 面板修改（保存后应用自动重启生效），无需改代码/重新部署。
+    本地开发时从 .streamlit/secrets.toml 读取（该文件已被 .gitignore 排除）。
+    """
+    try:
+        return str(st.secrets.get("access_password", "")).strip()
+    except Exception:
+        return ""
+
+
+@st.dialog("🔒 关注抖音进「AI职场群」解锁工具", width="medium", dismissible=False)
+def _show_access_gate():
+    # config.toml 里配了 primaryColor，但浏览器端可能缓存了旧主题/用户自己
+    # 改过主题设置，不一定会生效。直接给这个提交按钮加内联样式，不依赖主题，
+    # 保证一定是蓝色。
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stFormSubmitButton"] button {
+            background-color: #2196F3 !important;
+            border-color: #2196F3 !important;
+            color: white !important;
+        }
+        div[data-testid="stFormSubmitButton"] button:hover {
+            background-color: #1976D2 !important;
+            border-color: #1976D2 !important;
+        }
+        /* 密码框里浏览器自带的"钥匙"凭据建议按钮（自带一个小边框，跟 Streamlit
+           自己的显示/隐藏密码"眼睛"图标挤在一起，还会跟占位文字重叠）—— 隐藏掉，
+           只留 Streamlit 自己的眼睛图标。 */
+        input[type="password"]::-webkit-credentials-auto-fill-button,
+        input[type="password"]::-webkit-strong-password-auto-fill-button {
+            display: none !important;
+            visibility: hidden;
+            pointer-events: none;
+            position: absolute;
+            right: 0;
+        }
+        /* 密码框在 form 里会自动出现的"Press Enter to submit form"提示，
+           单独设置 placeholder 也盖不掉它（是叠加在输入框里的另一层提示，
+           不是 placeholder 本身），直接隐藏这个提示元素。 */
+        div[data-testid="InputInstructions"] {
+            display: none !important;
+        }
+        /* 输入框自带红/蓝双重描边（浏览器原生的必填校验红框 + Streamlit
+           自己的聚焦蓝框叠在一起），统一成一个普通灰色描边。 */
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stTextInput"] input:focus,
+        div[data-testid="stTextInput"] input:invalid,
+        div[data-testid="stTextInput"] > div,
+        div[data-testid="stTextInput"] > div:focus-within {
+            outline: none !important;
+            box-shadow: none !important;
+            border-color: #cccccc !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    col_qr, col_info = st.columns([1, 1])
+    with col_qr:
+        if os.path.exists(_DOUYIN_QR_PATH):
+            st.image(_DOUYIN_QR_PATH, use_container_width=True)
+        else:
+            st.warning("二维码图片缺失")
+    with col_info:
+        st.markdown(
+            "**@Wendy 云** · 抖音号：181496493\n\n"
+            "1️⃣ 扫码关注抖音\n\n"
+            "2️⃣ 主页/私信找到「AI职场群」入群方式，加入社群\n\n"
+            "3️⃣ 群公告里领取本工具的登录密码，填在下面解锁"
+        )
+        # 普通 st.text_input + st.button 组合，回车只会重跑脚本、不会触发
+        # 按钮的点击逻辑，必须点鼠标才有反应。包进 st.form 后，在密码框里
+        # 按回车等价于点了 form_submit_button，两种方式都能提交。
+        with st.form("access_gate_form"):
+            # 显式传 placeholder，覆盖掉 Streamlit 在 form 里给输入框自动加的
+            # "Press Enter to submit form" 提示文字（那行提示是多余的）。
+            access_password = st.text_input(
+                "登录密码", type="password", key="access_password_input",
+                placeholder="请输入密码",
+            )
+            submitted = st.form_submit_button("✅ 解锁使用", type="primary", use_container_width=True)
+        if submitted:
+            correct_password = _get_access_password()
+            if not correct_password:
+                st.error("⚠️ 站点还没有配置访问密码，请联系管理员")
+            elif access_password == correct_password:
+                st.session_state["unlocked"] = True
+                st.rerun()
+            else:
+                st.error("❌ 密码不对，请检查群公告里的最新密码")
+
+
+# ============================================================================
 # Streamlit UI 布局
 # ============================================================================
 
@@ -2289,8 +2806,10 @@ def render_sidebar():
         ("step2", "分析岗位核心要求"),
         ("step3", "选取简历文件夹"),
         ("step4", "搜索最佳匹配简历"),
-        ("step5", "本地改写简历"),
-        ("step6", "一键转 PDF"),
+        ("step5", "选择简历语言"),
+        ("step6", "智能改写简历"),
+        ("step7", "一键转 PDF"),
+        ("step8", "中译英一键翻译"),
     ]
     for sid, slabel in step_labels:
         done = steps.get(sid)
@@ -2651,6 +3170,10 @@ def convert_word_to_pdf(docx_path: str, output_dir: Optional[str] = None) -> Tup
 
 def render_main_area():
     """渲染主区域"""
+    if not st.session_state.get("unlocked", False):
+        _show_access_gate()
+        st.stop()
+
     # 苹果风格 Hero 标题
     st.markdown(
         '<h1 style="text-align:center; font-size:56px; margin-top:1rem;">智能简历匹配与改写</h1>',
@@ -2659,12 +3182,6 @@ def render_main_area():
     st.markdown(
         '<p style="text-align:center; font-size:21px; color:#86868b; font-weight:400; margin-top:-0.5rem; margin-bottom:0.5rem;">'
         '上传岗位描述，分析核心要求，匹配最佳简历，智能改写优化。'
-        '</p>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<p style="text-align:center; font-size:15px; color:#86868b;">'
-        '🔒 所有数据处理在本地完成 · 无需联网 · 无需下载模型 · 秒级响应'
         '</p>',
         unsafe_allow_html=True,
     )
@@ -2894,7 +3411,7 @@ def render_main_area():
     matched_list = st.session_state.get("matched_resumes_list", [])
     if matched_list:
         st.markdown("### 🏆 匹配结果（Top 3）")
-        st.caption("选择一份简历，然后进入步骤 5 改写")
+        st.caption("选择一份简历，然后进入步骤 5 选择简历语言")
 
         # 构建选项标签
         options = []
@@ -2956,28 +3473,94 @@ def render_main_area():
         st.markdown("---")
 
     # ========================================================================
-    # 步骤5：智能改写简历
+    # 步骤5：选择简历输出语言
     # ========================================================================
-    st.markdown("## ✨ 步骤 5：智能改写简历")
-    mode_options = ["🪄 本地改写（无需 API Key）", "🤖 大模型改写（需配置 API Key）"]
-    default_mode_idx = 1 if _llm_available() else 0
-    rewrite_mode_label = st.radio(
-        "改写模式",
-        options=mode_options,
-        index=st.session_state.get("rewrite_mode_index", default_mode_idx),
-        horizontal=True,
-        key="rewrite_mode_widget",
-    )
-    use_llm_mode = (rewrite_mode_label == mode_options[1])
-    st.session_state["rewrite_mode_index"] = mode_options.index(rewrite_mode_label)
+    st.markdown("## 🌐 步骤 5：选择简历输出语言")
 
-    if use_llm_mode:
-        if _llm_available():
-            st.caption(f"🤖 大模型引擎：{st.session_state['llm_model']} — 自然表达，杜绝模板重复")
-        else:
-            st.warning("⚠️ 还没有配置 API Key，请先在侧边栏「大模型改写」里填写，或切换到「本地改写」")
+    lang_display = {"zh": "中文", "en": "英文"}
+    jd_lang = _detect_language(st.session_state.get("job_description_text", ""))
+    resume_lang = None
+    if matched_list:
+        idx5 = st.session_state.get("selected_resume_index", 0)
+        resume_lang = _detect_language(matched_list[idx5].get("preview", ""))
+
+    if resume_lang:
+        st.caption(f"🔍 自动识别：岗位要求为{lang_display[jd_lang]}，原简历为{lang_display[resume_lang]}")
     else:
-        st.caption("💡 本地规则引擎（jieba 关键词匹配）— 不连接任何大模型，纯本地处理")
+        st.caption("请先完成步骤 4（搜索并选择一份简历）")
+
+    lang_options = ["🇨🇳 生成中文简历", "🇺🇸 生成英文简历"]
+    default_lang_idx = 1 if resume_lang == "en" else 0
+    lang_choice = st.radio(
+        "新简历使用的语言",
+        options=lang_options,
+        index=st.session_state.get("output_language_index", default_lang_idx),
+        horizontal=True,
+        disabled=not bool(matched_list),
+        key="output_lang_widget",
+    )
+    output_language = "zh" if lang_choice == lang_options[0] else "en"
+    st.session_state["output_language"] = output_language
+    st.session_state["output_language_index"] = lang_options.index(lang_choice)
+
+    need_translation = bool(resume_lang) and (resume_lang != output_language)
+    st.session_state["need_translation"] = need_translation
+
+    if need_translation:
+        st.info(
+            f"🌐 原简历为{lang_display[resume_lang]}，你选择生成{lang_display[output_language]}简历，"
+            f"需要真正翻译改写。本地规则引擎不具备翻译能力，进入步骤 6 后会自动锁定为「大模型改写」。"
+        )
+    elif resume_lang:
+        st.caption("✅ 语言一致，无需翻译，本地或大模型改写均可。")
+
+    st.session_state["step_completed"]["step5"] = bool(matched_list)
+
+    st.markdown("---")
+
+    # ========================================================================
+    # 步骤6：智能改写简历
+    # ========================================================================
+    st.markdown("## ✨ 步骤 6：智能改写简历")
+    need_translation = st.session_state.get("need_translation", False)
+    output_language = st.session_state.get("output_language", "zh")
+    mode_options = ["🪄 本地改写（无需 API Key）", "🤖 大模型改写（需配置 API Key）"]
+
+    if need_translation:
+        use_llm_mode = True
+        st.radio(
+            "改写模式",
+            options=mode_options,
+            index=1,
+            horizontal=True,
+            disabled=True,
+            key="rewrite_mode_widget_forced",
+        )
+        st.warning(
+            f"🌐 需要把简历翻译成{lang_display[output_language]}，本地规则引擎不具备翻译能力，"
+            "已自动锁定为「大模型改写」。"
+        )
+        if not _llm_available():
+            st.warning("⚠️ 还没有配置 API Key，请先在侧边栏「大模型改写」里填写")
+    else:
+        default_mode_idx = 1 if _llm_available() else 0
+        rewrite_mode_label = st.radio(
+            "改写模式",
+            options=mode_options,
+            index=st.session_state.get("rewrite_mode_index", default_mode_idx),
+            horizontal=True,
+            key="rewrite_mode_widget",
+        )
+        use_llm_mode = (rewrite_mode_label == mode_options[1])
+        st.session_state["rewrite_mode_index"] = mode_options.index(rewrite_mode_label)
+
+        if use_llm_mode:
+            if _llm_available():
+                st.caption(f"🤖 大模型引擎：{st.session_state['llm_model']} — 自然表达，杜绝模板重复")
+            else:
+                st.warning("⚠️ 还没有配置 API Key，请先在侧边栏「大模型改写」里填写，或切换到「本地改写」")
+        else:
+            st.caption("💡 本地规则引擎（jieba 关键词匹配）— 不连接任何大模型，纯本地处理")
 
     custom_prompt = st.text_area(
         "补充要求（可选）",
@@ -2989,10 +3572,10 @@ def render_main_area():
     )
     st.session_state["custom_rewrite_prompt"] = custom_prompt
 
-    col_btn5, _ = st.columns([1, 4])
-    with col_btn5:
+    col_btn6, _ = st.columns([1, 4])
+    with col_btn6:
         rewrite_disabled = (
-            not st.session_state["step_completed"].get("step4", False)
+            not st.session_state["step_completed"].get("step5", False)
             or (use_llm_mode and not _llm_available())
         )
         btn_label = "🤖 大模型智能改写" if use_llm_mode else "🪄 本地改写简历"
@@ -3017,6 +3600,7 @@ def render_main_area():
                         st.session_state["job_description_text"],
                         st.session_state.get("job_analysis_result", {}),
                         custom_instructions,
+                        output_language,
                     )
                 else:
                     new_path = _rewrite_resume_local(
@@ -3028,7 +3612,7 @@ def render_main_area():
                 st.session_state["optimized_resume_path"] = new_path
                 st.session_state["optimized_resume_name"] = os.path.basename(new_path)
                 st.session_state["last_rewrite_mode"] = "llm" if use_llm_mode else "local"
-                st.session_state["step_completed"]["step5"] = True
+                st.session_state["step_completed"]["step6"] = True
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ 简历改写失败: {e}")
@@ -3098,12 +3682,12 @@ def render_main_area():
     st.markdown("---")
 
     # ========================================================================
-    # 步骤6：一键转 PDF
+    # 步骤7：一键转 PDF
     # ========================================================================
-    st.markdown("## 📑 步骤 6：一键转 PDF")
+    st.markdown("## 📑 步骤 7：一键转 PDF")
     st.caption("将改写后的 Word 简历一键转换为 PDF，或上传其他 Word 文件转 PDF")
 
-    # ---- 选项 A：转换步骤 5 生成的简历 ----
+    # ---- 选项 A：转换步骤 6 生成的简历 ----
     has_optimized = (
         st.session_state.get("optimized_resume_path")
         and os.path.exists(st.session_state["optimized_resume_path"])
@@ -3126,7 +3710,7 @@ def render_main_area():
                             )
                             st.session_state["generated_pdf_path"] = pdf_path
                             st.session_state["generated_pdf_name"] = os.path.basename(pdf_path)
-                            st.session_state["step_completed"]["step6"] = True
+                            st.session_state["step_completed"]["step7"] = True
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ PDF 转换失败：{e}")
@@ -3147,7 +3731,7 @@ def render_main_area():
                 )
                 st.caption(f"文件大小：{len(pdf_data) / 1024:.0f} KB")
         else:
-            st.warning("⚠️ 请先完成步骤 5（改写简历），或切换到「上传其他 Word 文件」标签页")
+            st.warning("⚠️ 请先完成步骤 6（改写简历），或切换到「上传其他 Word 文件」标签页")
 
     with tab_b:
         uploaded_docx = st.file_uploader(
@@ -3186,7 +3770,7 @@ def render_main_area():
 
                             st.session_state["generated_pdf_path"] = pdf_path
                             st.session_state["generated_pdf_name"] = os.path.basename(pdf_path)
-                            st.session_state["step_completed"]["step6"] = True
+                            st.session_state["step_completed"]["step7"] = True
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ PDF 转换失败：{e}")
@@ -3206,6 +3790,68 @@ def render_main_area():
                     key="download_pdf_upload",
                 )
                 st.caption(f"文件大小：{len(pdf_data) / 1024:.0f} KB")
+
+    # ========================================================================
+    # 步骤8：中文简历一键翻译成英文 + 统一字体
+    # ========================================================================
+    st.markdown("## 🌐 步骤 8：中译英一键翻译")
+    st.caption("独立功能，无需先完成前面的步骤 —— 直接上传任意中文 Word 简历，翻译成英文并统一字体")
+
+    if not _llm_available():
+        st.warning("⚠️ 翻译需要调用大模型（本地规则引擎不具备翻译能力），请先在侧边栏「大模型改写」里配置 API Key")
+
+    uploaded_cn_resume = st.file_uploader(
+        "选择需要翻译的中文 Word 简历 (.docx)",
+        type=["docx"],
+        key="upload_docx_for_translate",
+    )
+
+    if uploaded_cn_resume:
+        st.info(f"📄 已选择：**{uploaded_cn_resume.name}**")
+        if st.button("🌐 一键翻译成英文简历", type="primary",
+                     disabled=not _llm_available(),
+                     use_container_width=True,
+                     key="btn_translate_to_en"):
+            with st.spinner("⏳ 正在翻译..."):
+                try:
+                    original_name = uploaded_cn_resume.name
+                    base_name = os.path.splitext(original_name)[0]
+                    safe_name = re.sub(r'[^\w一-鿿\-_.]', '_', base_name)
+                    tmp_dir = tempfile.gettempdir()
+                    docx_path = os.path.join(tmp_dir, f"{safe_name}_translate_src.docx")
+                    with open(docx_path, "wb") as f:
+                        f.write(uploaded_cn_resume.getvalue())
+
+                    translated_path = _translate_resume_to_english(docx_path)
+
+                    try:
+                        os.unlink(docx_path)
+                    except Exception:
+                        pass
+
+                    st.session_state["translated_resume_path"] = translated_path
+                    st.session_state["translated_resume_name"] = os.path.basename(translated_path)
+                    st.session_state["step_completed"]["step8"] = True
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 翻译失败：{e}")
+
+    translated_path = st.session_state.get("translated_resume_path")
+    if translated_path and os.path.exists(translated_path):
+        st.success("🎉 翻译完成！")
+        with open(translated_path, "rb") as f:
+            translated_data = f.read()
+        st.download_button(
+            label=f"📥 下载英文简历 ({st.session_state['translated_resume_name']})",
+            data=translated_data,
+            file_name=st.session_state["translated_resume_name"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="download_translated_resume",
+        )
+        st.caption("✅ 字体已统一为 Calibri 11 号，原文档排版/表格结构保持不变")
+
+    st.markdown("---")
 
     # ========================================================================
     # 页脚

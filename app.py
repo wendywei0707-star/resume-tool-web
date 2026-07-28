@@ -430,6 +430,8 @@ def init_session_state():
         },
         "generated_pdf_path": None,
         "generated_pdf_name": None,
+        "custom_rewrite_prompt": "",
+        "last_rewrite_mode": None,
         # LLM 配置：每个会话独立，不预填任何人的 Key
         "llm_api_key": "",
         "llm_base_url": "https://api.deepseek.com",
@@ -1167,8 +1169,9 @@ def _write_item_if_changed(item, new_text: str) -> bool:
             for r_idx in range(1, len(para.runs)):
                 para.runs[r_idx].text = ""
             first_run.text = new_text
+            first_run.bold = False
         else:
-            para.add_run(new_text)
+            para.add_run(new_text).bold = False
         return True
 
     elif src_type == "table_cell":
@@ -1183,8 +1186,9 @@ def _write_item_if_changed(item, new_text: str) -> bool:
                 for r_idx in range(1, len(para.runs)):
                     para.runs[r_idx].text = ""
                 first_run.text = new_text
+                first_run.bold = False
             else:
-                para.add_run(new_text)
+                para.add_run(new_text).bold = False
             return True
 
     return False
@@ -1217,7 +1221,7 @@ def _texts_effectively_equal(text1: str, text2: str) -> bool:
 
 
 def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
-                              resume_text: str) -> Tuple[str, str]:
+                              resume_text: str, custom_instructions: str = "") -> Tuple[str, str]:
     """
     按用户建议，一次性把完整 JD 和完整简历发给 LLM，让它产出完整新简历。
     Prompt 强调：【禁止复制原文】，必须根据 JD 真正改写内容。
@@ -1225,6 +1229,15 @@ def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
     keywords = job_analysis.get("keywords", [])
     requirements = job_analysis.get("requirements", [])
     skills = job_analysis.get("skills", [])
+
+    custom_instructions_block = ""
+    if custom_instructions.strip():
+        custom_instructions_block = (
+            "\n📌 用户补充要求（在满足以上所有规则的前提下，请优先遵循）：\n"
+            "═══════════════════════════════════════\n"
+            f"{custom_instructions.strip()}\n"
+            "═══════════════════════════════════════\n"
+        )
 
     system_prompt = (
         "你是一位顶级简历优化专家，专门帮求职者根据目标岗位JD优化简历。\n\n"
@@ -1309,7 +1322,7 @@ def _build_rewrite_prompt_v2(job_description: str, job_analysis: Dict,
 {resume_text}
 
 ═══════════════════════════════════════
-
+{custom_instructions_block}
 请现在开始输出改写后的完整简历。记住：内容必须实质性改写，禁止复制原文，必须融入所有JD关键词。"""
     return system_prompt, user_prompt
 
@@ -1341,7 +1354,7 @@ def _parse_llm_resume_output(response_text: str) -> Dict[str, str]:
 
 
 def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
-                              job_analysis: Dict) -> str:
+                              job_analysis: Dict, custom_instructions: str = "") -> str:
     """
     使用大模型(LLM)一次性改写整份简历，再按区块回填到 docx。
     彻底解决段落编号导致的重复问题。
@@ -1358,7 +1371,7 @@ def _rewrite_resume_with_llm(matched_doc_path: str, job_description: str,
     # 3. 构建 Prompt 并调用 LLM
     with st.spinner("🧠 LLM 正在理解岗位要求并重写整份简历（约 20-40 秒）..."):
         system_prompt, user_prompt = _build_rewrite_prompt_v2(
-            job_description, job_analysis, full_resume_text)
+            job_description, job_analysis, full_resume_text, custom_instructions)
 
         response_text = _call_llm(system_prompt, user_prompt)
 
@@ -2060,23 +2073,21 @@ def _enhance_experience_text(text: str,
 # 3.6 改写主函数（LLM 优先，jieba 兜底）
 # ---------------------------------------------------------------------------
 
-def rewrite_resume(matched_doc_path: str, job_description: str, job_analysis: Dict) -> str:
+def _rewrite_resume_local(matched_doc_path: str, job_description: str, job_analysis: Dict,
+                           custom_instructions: str = "") -> str:
     """
-    智能简历改写引擎 — 双引擎架构：
-    1. 如果配置了 LLM API Key → 使用大模型推理改写（自然、无重复）
-    2. 否则 → 使用本地 jieba + 规则引擎兜底
-    
-    返回：优化后简历的文件路径。
-    """
-    # ====== 检测 LLM 是否可用 ======
-    if _llm_available():
-        return _rewrite_resume_with_llm(matched_doc_path, job_description, job_analysis)
+    本地规则引擎改写（jieba 关键词匹配，不调用任何大模型 API）。
 
-    # ====== 本地规则引擎（jieba，作为兜底方案） ======
-    st.info("💡 未配置 LLM API Key，使用本地规则引擎改写（侧边栏可配置 LLM 获得更好效果）")
-    # ====== 1. 深度分析 JD ======
+    补充要求（custom_instructions）没有 LLM 去理解语义，这里的处理方式是把它当成
+    额外的"岗位要求文本"一起参与关键词提取——填了什么词，权重就会更高、更容易被
+    编织进改写结果，效果类似于"给关键词提取加了个提示"，而不是自由格式的语义改写。
+    """
+    # ====== 1. 深度分析 JD（叠加用户补充要求，一起参与关键词提取） ======
     with st.spinner("🔬 正在深度分析岗位核心要求..."):
-        jd_deep = _analyze_jd_deep(job_description, job_analysis)
+        combined_job_text = job_description
+        if custom_instructions.strip():
+            combined_job_text = f"{job_description}\n{custom_instructions.strip()}"
+        jd_deep = _analyze_jd_deep(combined_job_text, job_analysis)
         top_keywords = jd_deep["top_keywords"]
         hard_skills = jd_deep["hard_skills"]
         soft_skills = jd_deep["soft_skills"]
@@ -2194,8 +2205,9 @@ def rewrite_resume(matched_doc_path: str, job_description: str, job_analysis: Di
                     for i in range(1, len(para.runs)):
                         para.runs[i].text = ""
                     first_run.text = new_text
+                    first_run.bold = False
                 else:
-                    para.add_run(new_text)
+                    para.add_run(new_text).bold = False
                 total_modified += 1
 
             para_idx += 1
@@ -2229,8 +2241,9 @@ def rewrite_resume(matched_doc_path: str, job_description: str, job_analysis: Di
                                     for i in range(1, len(para.runs)):
                                         para.runs[i].text = ""
                                     first_run.text = new_text
+                                    first_run.bold = False
                                 else:
-                                    para.add_run(new_text)
+                                    para.add_run(new_text).bold = False
                                 total_modified += 1
 
     # ====== 4. 保存新文件 ======
@@ -2946,15 +2959,43 @@ def render_main_area():
     # 步骤5：智能改写简历
     # ========================================================================
     st.markdown("## ✨ 步骤 5：智能改写简历")
-    if _llm_available():
-        st.caption(f"🤖 大模型引擎：{st.session_state['llm_model']} — 自然表达，杜绝模板重复")
+    mode_options = ["🪄 本地改写（无需 API Key）", "🤖 大模型改写（需配置 API Key）"]
+    default_mode_idx = 1 if _llm_available() else 0
+    rewrite_mode_label = st.radio(
+        "改写模式",
+        options=mode_options,
+        index=st.session_state.get("rewrite_mode_index", default_mode_idx),
+        horizontal=True,
+        key="rewrite_mode_widget",
+    )
+    use_llm_mode = (rewrite_mode_label == mode_options[1])
+    st.session_state["rewrite_mode_index"] = mode_options.index(rewrite_mode_label)
+
+    if use_llm_mode:
+        if _llm_available():
+            st.caption(f"🤖 大模型引擎：{st.session_state['llm_model']} — 自然表达，杜绝模板重复")
+        else:
+            st.warning("⚠️ 还没有配置 API Key，请先在侧边栏「大模型改写」里填写，或切换到「本地改写」")
     else:
-        st.caption("💡 本地规则引擎 — 侧边栏配置 LLM API Key 可获得更自然的改写效果")
+        st.caption("💡 本地规则引擎（jieba 关键词匹配）— 不连接任何大模型，纯本地处理")
+
+    custom_prompt = st.text_area(
+        "补充要求（可选）",
+        value=st.session_state.get("custom_rewrite_prompt", ""),
+        placeholder="例如：更突出数字化转型经验、语气更正式、强调团队管理规模…\n"
+                    "本地改写：会作为额外关键词参与匹配；大模型改写：会作为改写指令交给大模型",
+        height=80,
+        key="custom_prompt_widget",
+    )
+    st.session_state["custom_rewrite_prompt"] = custom_prompt
 
     col_btn5, _ = st.columns([1, 4])
     with col_btn5:
-        rewrite_disabled = not st.session_state["step_completed"].get("step4", False)
-        btn_label = "🤖 LLM 智能改写" if _llm_available() else "🪄 本地改写简历"
+        rewrite_disabled = (
+            not st.session_state["step_completed"].get("step4", False)
+            or (use_llm_mode and not _llm_available())
+        )
+        btn_label = "🤖 大模型智能改写" if use_llm_mode else "🪄 本地改写简历"
         rewrite_btn = st.button(
             btn_label,
             type="primary",
@@ -2969,13 +3010,24 @@ def render_main_area():
         if idx < len(matched_list):
             selected = matched_list[idx]
             try:
-                new_path = rewrite_resume(
-                    selected["path"],
-                    st.session_state["job_description_text"],
-                    st.session_state.get("job_analysis_result", {}),
-                )
+                custom_instructions = st.session_state.get("custom_rewrite_prompt", "").strip()
+                if use_llm_mode:
+                    new_path = _rewrite_resume_with_llm(
+                        selected["path"],
+                        st.session_state["job_description_text"],
+                        st.session_state.get("job_analysis_result", {}),
+                        custom_instructions,
+                    )
+                else:
+                    new_path = _rewrite_resume_local(
+                        selected["path"],
+                        st.session_state["job_description_text"],
+                        st.session_state.get("job_analysis_result", {}),
+                        custom_instructions,
+                    )
                 st.session_state["optimized_resume_path"] = new_path
                 st.session_state["optimized_resume_name"] = os.path.basename(new_path)
+                st.session_state["last_rewrite_mode"] = "llm" if use_llm_mode else "local"
                 st.session_state["step_completed"]["step5"] = True
                 st.rerun()
             except Exception as e:
@@ -3000,7 +3052,7 @@ def render_main_area():
             use_container_width=True,
         )
 
-        if _llm_available():
+        if st.session_state.get("last_rewrite_mode") == "llm":
             st.info(f"""
             **🤖 LLM 智能改写引擎**
             

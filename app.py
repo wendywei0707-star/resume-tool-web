@@ -2189,6 +2189,13 @@ def _match_keywords_to_section(keywords_with_weights, section_text: str,
 # 3.4 自然关键词嵌入策略（核心：关键词在句首/句中出现，而非末尾追加）
 # ---------------------------------------------------------------------------
 
+def _is_chinese(text: str) -> bool:
+    """判断文本是否包含中文字符"""
+    if not text:
+        return False
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+
 def _natural_weave_keyword(text: str, keyword: str, position: str = "auto") -> str:
     """
     将 keyword 自然地编织进 text 中，让关键词在显眼位置（句首/句中）出现。
